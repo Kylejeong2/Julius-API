@@ -36,7 +36,9 @@ yarn-error.log*
 next-env.d.ts
 
 julius-api-server/venv
+julius-api-server/__pycache__
 julius-api-server/app.log
+julius-api-server/cookies.json
 
 .env
 script.template
