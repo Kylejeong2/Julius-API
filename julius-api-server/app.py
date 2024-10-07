@@ -78,9 +78,8 @@ def store_cookies(browser_tab: Page):
     print(f"Saved {len(all_cookies)} cookie(s) from the browser context")
 
 
-def restore_cookies(browser_tab: Page):
+async def restore_cookies(browser_tab: Page):
     # Return all cookies to the browser context
-
     try:
         with open(COOKIE_FILE) as cookie_file:
             cookies = json.load(cookie_file)
@@ -88,8 +87,8 @@ def restore_cookies(browser_tab: Page):
         # No cookies to restore
         return
 
-    browser_tab.context.add_cookies(cookies)
-    print(f"Restored {len(cookies)} cookie(s) to the browser context")
+    await browser_tab.context.add_cookies(cookies)
+    logger.info(f"Restored {len(cookies)} cookie(s) to the browser context")
 
 async def get_session_live_url(session_id: str):
     url = f"https://www.browserbase.com/v1/sessions/{session_id}/debug"
@@ -108,6 +107,8 @@ async def get_session_live_url(session_id: str):
 
 async def login_to_julius(page, email: str, password: str):
     logger.info(f"Attempting to log in to Julius.ai with email: {email}")
+
+    await restore_cookies(page)
 
     await page.goto('https://julius.ai/chat?iss=https%3A%2F%2Fauth.julius.ai%2F')
 
@@ -166,20 +167,18 @@ async def prompt_julius(request: PromptRequest):
             live_url = await get_session_live_url(session_id)
             logger.info(f"@Browserbase Live session URL: {live_url}")
 
-            logger.info("Logging in to Julius.ai")
-            await page.goto('https://julius.ai/chat?iss=https%3A%2F%2Fauth.julius.ai%2F')
-            try:
-                await page.wait_for_selector('button:has-text("Continue with email")', timeout=5000)
-                needToLogin = True
-                logger.info("Need to login to Julius.ai")
-            except:
-                needToLogin = False
-            
-            if needToLogin:
-                await login_to_julius(page, request.email, request.password)
-            else:
+            logger.info("Restoring cookies")
+            await restore_cookies(page)
+
+            if 'https://julius.ai/chat' in page.url:
                 logger.info("Already logged in to Julius.ai")
+            else:
+                logger.info("Need to login to Julius.ai")
+                await page.goto('https://julius.ai/chat?iss=https%3A%2F%2Fauth.julius.ai%2F')
+                await login_to_julius(page, request.email, request.password)
             
+            logger.info("Logged in to Julius.ai Sucessfully")
+
             logger.info(f"Submitting prompt: {request.prompt[:50]}...")  # Log first 50 chars of prompt
             await page.fill('textarea[data-cy="chat-input-box"]', request.prompt)
             await page.click('button[type="submit"]')
