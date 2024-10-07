@@ -7,9 +7,12 @@ import os
 from dotenv import load_dotenv
 import asyncio
 from playwright.async_api import async_playwright, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from loguru import logger
 import httpx
 import json
+import time
+import uvicorn
 
 load_dotenv()
 
@@ -41,6 +44,20 @@ class PromptRequest(BaseModel):
     email: str
     password: str
 
+class SolveState:
+    started = False
+    finished = False
+    START_MSG = "browserbase-solving-started"
+    END_MSG = "browserbase-solving-finished"
+
+    def handle_console(self, msg):
+        if msg.text == self.START_MSG:
+            self.started = True
+            logger.info("AI has started solving the CAPTCHA...")
+        elif msg.text == self.END_MSG:
+            self.finished = True
+            logger.info("AI solved the CAPTCHA!")
+
 async def create_browserbase_session():
     url = "https://www.browserbase.com/v1/sessions"
     headers = {
@@ -50,10 +67,10 @@ async def create_browserbase_session():
     payload = {
         "projectId": os.getenv('BROWSERBASE_PROJECT_ID'),
         "browserSettings": {
-            "blockAds": True,
+            "blockAds": True, 
             "solveCaptchas": True,
-            "recordSession": True,
-            "logSession": True
+            # "recordSession": True,
+            # "logSession": True
         },
         "proxies": True,
         "timeout": 600  # 10 minutes, adjust as needed
@@ -65,30 +82,6 @@ async def create_browserbase_session():
         return response.json()['id']
     else:
         raise HTTPException(status_code=500, detail=f"Failed to create Browserbase session: {response.text}")
-
-def store_cookies(browser_tab: Page):
-    # Retrieve all the cookies for this URL
-    all_cookies = browser_tab.context.cookies(SITE_URL)
-
-    # You might want to put these in some durable storage, but for now
-    # just keep them in a simple file as JSON.
-    with open(COOKIE_FILE, "w") as cookie_file:
-        json.dump(all_cookies, cookie_file, indent=4)
-
-    print(f"Saved {len(all_cookies)} cookie(s) from the browser context")
-
-
-async def restore_cookies(browser_tab: Page):
-    # Return all cookies to the browser context
-    try:
-        with open(COOKIE_FILE) as cookie_file:
-            cookies = json.load(cookie_file)
-    except FileNotFoundError:
-        # No cookies to restore
-        return
-
-    await browser_tab.context.add_cookies(cookies)
-    logger.info(f"Restored {len(cookies)} cookie(s) to the browser context")
 
 async def get_session_live_url(session_id: str):
     url = f"https://www.browserbase.com/v1/sessions/{session_id}/debug"
@@ -105,7 +98,7 @@ async def get_session_live_url(session_id: str):
         logger.error(f"Failed to get session live URL: {response.text}")
         return None
 
-async def login_to_julius(page, email: str, password: str):
+async def login_to_julius(page: Page, email: str, password: str):
     logger.info(f"Attempting to log in to Julius.ai with email: {email}")
 
     await restore_cookies(page)
@@ -114,7 +107,7 @@ async def login_to_julius(page, email: str, password: str):
 
     await page.wait_for_selector('button:has-text("Continue with email")')
     await page.click('button:has-text("Continue with email")')
-    await page.wait_for_load_state('networkidle')  # Wait until the page is fully loaded
+    await page.wait_for_load_state('networkidle')
 
     logger.info(f"Clicked 'Continue with email' button. Current URL: {page.url}")
     
@@ -124,23 +117,59 @@ async def login_to_julius(page, email: str, password: str):
     await page.wait_for_selector('input[name="password"][id="password"][type="password"][autocomplete="current-password"]')
     await page.fill('input[name="password"][id="password"][type="password"][autocomplete="current-password"]', password)
     logger.info(f"Filled password field with: {password}")
-    await page.screenshot(path="beforewait.png", full_page=True)
 
-    await page.wait_for_timeout(5000)
+    await page.screenshot(path="before_captcha.png", full_page=True)
 
-    await page.screenshot(path="screenshotbefore.png", full_page=True)
+    state = SolveState()
+    page.on("console", state.handle_console)
 
+    logger.info("Clicking 'Continue' button and waiting for potential CAPTCHA...")
     await page.click('button[type="submit"][name="action"][value="default"][data-action-button-primary="true"]')
 
-    await page.screenshot(path="screenshot.png", full_page=True)
+    try:
+        async with page.expect_console_message(
+            lambda msg: msg.text == SolveState.END_MSG,
+            timeout=30000,  # Increased timeout to 30 seconds
+        ):
+            # Wait for the CAPTCHA to be solved or timeout
+            pass
+    except PlaywrightTimeoutError:
+        logger.warning("Timeout: No CAPTCHA solving event detected after 30 seconds")
+        logger.info(f"Solve state: started={state.started}, finished={state.finished}")
 
-    logger.info("Clicked 'Continue' button. Waiting for Julius.ai to load...")
-    await page.wait_for_load_state('networkidle')  # Wait until the page is fully loaded
+    if state.started != state.finished:
+        logger.warning(f"Solving mismatch! started={state.started}, finished={state.finished}")
+    elif state.started == state.finished == False:
+        logger.info("No CAPTCHA was presented, or was solved too quickly to detect.")
+    else:
+        logger.info("CAPTCHA is complete.")
+
+    await page.screenshot(path="after_captcha.png", full_page=True)
+
+    await page.wait_for_load_state('networkidle')
 
     if 'https://julius.ai/chat' in page.url:
-        logger.success("Successfully logged in to Julius.ai with email")
+        logger.success("Successfully logged in to Julius.ai")
+        await store_cookies(page)
     else:
         raise HTTPException(status_code=500, detail=f"Failed to log in to Julius.ai. Current URL: {page.url}")
+
+    await page.screenshot(path="after_login.png", full_page=True)
+
+async def store_cookies(page):
+    cookies = await page.context.cookies()
+    with open("cookies.json", "w") as f:
+        json.dump(cookies, f)
+    logger.info("Stored cookies after successful login")
+
+async def restore_cookies(page):
+    try:
+        with open("cookies.json", "r") as f:
+            cookies = json.load(f)
+        await page.context.add_cookies(cookies)
+        logger.info("Restored cookies from previous session")
+    except FileNotFoundError:
+        logger.info("No stored cookies found")
 
 async def wait_for_response(page):
     logger.info("Waiting for response from Julius.ai")
@@ -219,6 +248,5 @@ async def prompt_julius(request: PromptRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == '__main__':
-    import uvicorn
     logger.info("Starting FastAPI server")
     uvicorn.run(app, host='127.0.0.1', port=5000)
