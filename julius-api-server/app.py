@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from browserbase import Browserbase
-from scrapegraphai.graphs import OmniScraperGraph
+from scrapegraphai.graphs import SmartScraperGraph
 import os
 from dotenv import load_dotenv
 import asyncio
@@ -11,25 +11,23 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from loguru import logger
 import httpx
 import json
-import time
 import uvicorn
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
-# Configure loguru
-logger.remove()  # Remove default handler
+logger.remove()
 logger.add("app.log", rotation="10 MB", retention="1 week", level="INFO")
-logger.add(lambda msg: print(msg, flush=True), level="INFO")  # Also log to console
+logger.add(lambda msg: print(msg, flush=True), level="INFO")
 
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 browserbase = Browserbase(os.getenv('BROWSERBASE_API_KEY'), os.getenv('BROWSERBASE_PROJECT_ID'))
@@ -73,7 +71,7 @@ async def create_browserbase_session():
             # "logSession": True
         },
         "proxies": True,
-        "timeout": 600  # 10 minutes, adjust as needed
+        "timeout": 600  
     }
     
     async with httpx.AsyncClient() as client:
@@ -83,7 +81,7 @@ async def create_browserbase_session():
     else:
         raise HTTPException(status_code=500, detail=f"Failed to create Browserbase session: {response.text}")
 
-async def get_session_live_url(session_id: str):
+# async def get_session_live_url(session_id: str):
     url = f"https://www.browserbase.com/v1/sessions/{session_id}/debug"
     headers = {
         "X-BB-API-Key": os.getenv('BROWSERBASE_API_KEY')
@@ -118,8 +116,6 @@ async def login_to_julius(page: Page, email: str, password: str):
     await page.fill('input[name="password"][id="password"][type="password"][autocomplete="current-password"]', password)
     logger.info(f"Filled password field with: {password}")
 
-    await page.screenshot(path="before_captcha.png", full_page=True)
-
     state = SolveState()
     page.on("console", state.handle_console)
 
@@ -129,9 +125,8 @@ async def login_to_julius(page: Page, email: str, password: str):
     try:
         async with page.expect_console_message(
             lambda msg: msg.text == SolveState.END_MSG,
-            timeout=30000,  # Increased timeout to 30 seconds
+            timeout=30000,
         ):
-            # Wait for the CAPTCHA to be solved or timeout
             pass
     except PlaywrightTimeoutError:
         logger.warning("Timeout: No CAPTCHA solving event detected after 30 seconds")
@@ -144,8 +139,6 @@ async def login_to_julius(page: Page, email: str, password: str):
     else:
         logger.info("CAPTCHA is complete.")
 
-    await page.screenshot(path="after_captcha.png", full_page=True)
-
     await page.wait_for_load_state('networkidle')
 
     if 'https://julius.ai/chat' in page.url:
@@ -153,8 +146,6 @@ async def login_to_julius(page: Page, email: str, password: str):
         await store_cookies(page)
     else:
         raise HTTPException(status_code=500, detail=f"Failed to log in to Julius.ai. Current URL: {page.url}")
-
-    await page.screenshot(path="after_login.png", full_page=True)
 
 async def store_cookies(page):
     cookies = await page.context.cookies()
@@ -167,7 +158,13 @@ async def restore_cookies(page):
         with open("cookies.json", "r") as f:
             cookies = json.load(f)
         await page.context.add_cookies(cookies)
-        logger.info("Restored cookies from previous session")
+        await page.goto('https://julius.ai/chat')
+        await page.wait_for_load_state('networkidle')
+
+        if 'https://julius.ai/chat' in page.url:
+            logger.info("Restored cookies from previous session")
+        else:
+            logger.info("Failed to restore cookies from previous session")
     except FileNotFoundError:
         logger.info("No stored cookies found")
 
@@ -176,6 +173,16 @@ async def wait_for_response(page):
     await asyncio.sleep(45)
     logger.info("Wait time for response completed")
     return True
+
+async def extract_content(html_content):
+    soup = BeautifulSoup(html_content, 'html.parser')
+    target_div = soup.find_all('div', class_="relative flex flex-col w-full gap-2 py-3 sm:p-3 rounded-2xl sm:border sm:bg-gray-50 sm:border-gray-100 sm:dark:bg-neutral-800 sm:dark:border-neutral-800")[1]
+    
+    if target_div:
+        return target_div.get_text(strip=True)
+    else:
+        logger.warning("Target div not found in the HTML content")
+        return ""
 
 @app.post('/api/prompt')
 async def prompt_julius(request: PromptRequest):
@@ -193,8 +200,8 @@ async def prompt_julius(request: PromptRequest):
             browser = await chromium.connect_over_cdp(browserbase.get_connect_url())
             page = await browser.new_page()
 
-            live_url = await get_session_live_url(session_id)
-            logger.info(f"@Browserbase Live session URL: {live_url}")
+            # live_url = await get_session_live_url(session_id)
+            # logger.info(f"@Browserbase Live session URL: {live_url}")
 
             logger.info("Restoring cookies")
             await restore_cookies(page)
@@ -206,42 +213,47 @@ async def prompt_julius(request: PromptRequest):
                 await page.goto('https://julius.ai/chat?iss=https%3A%2F%2Fauth.julius.ai%2F')
                 await login_to_julius(page, request.email, request.password)
             
-            logger.info("Logged in to Julius.ai Sucessfully")
+            logger.info("Logged in to Julius.ai Successfully")
 
-            logger.info(f"Submitting prompt: {request.prompt[:50]}...")  # Log first 50 chars of prompt
+            logger.info(f"Submitting prompt: {request.prompt[:50]}...")
+            await page.wait_for_selector('textarea[data-cy="chat-input-box"]')
             await page.fill('textarea[data-cy="chat-input-box"]', request.prompt)
             await page.click('button[type="submit"]')
-            
+
             if not await wait_for_response(page):
                 logger.error("Timeout waiting for response from Julius.ai")
                 raise HTTPException(status_code=500, detail="Timeout waiting for response")
 
-            logger.info("Configuring OmniScraperGraph")
+            logger.info("Getting page URL", page_url=page.url)
+            page_url = page.url
+
+            page_content = await page.content()
+            logger.info("Extracted page content")
+
+            extracted_text = await extract_content(page_content)
+            logger.info("Extracted text from target div")
+
             graph_config = {
                 "llm": {
-                    "model": "gpt-4o-mini",
                     "api_key": os.getenv('OPENAI_API_KEY'),
+                    "model": "openai/gpt-4o-mini",
                 },
+                "verbose": True,
                 "headless": True,
             }
 
-            logger.info("Running OmniScraperGraph")
-            omni_scraper_graph = OmniScraperGraph(
-                prompt="Extract the text response and any code blocks from the Julius chat interface.",
-                source=await page.content(),
+            smart_scraper_graph = SmartScraperGraph(
+                prompt="Extract the text response and any code blocks from the given content. Also, save the images generated by the ai if possible. Return a JSON with text, code, and images.",
+                source=extracted_text,
                 config=graph_config
             )
 
-            result = omni_scraper_graph.run()
-
-            response_text = result.get('text', '')
-            response_code = result.get('code', '')
+            result = smart_scraper_graph.run()
 
             logger.success("Successfully processed Julius.ai response")
             return {
-                'text': response_text,
-                'code': response_code,
-                'live_url': live_url
+                'result': result,
+                'page_url': page_url
             }
     except Exception as e:
         logger.exception(f"An error occurred: {str(e)}")

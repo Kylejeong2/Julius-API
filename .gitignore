@@ -42,3 +42,5 @@ julius-api-server/cookies.json
 
 .env
 script.template
+
+/venv
