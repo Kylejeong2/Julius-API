@@ -33,4 +33,6 @@ pip install -r requirements.txt
 streamlit run streamlit.py
 ```
 
+feel free to make PRs to build out the streamlit system, I don't have a ton of time to make a GUI.
+
 and you should be able to prompt it there.
